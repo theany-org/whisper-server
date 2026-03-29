@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.middleware.auth import get_current_user_id
 from app.models.user import User
+from app.redis import get_redis
 from app.schemas.auth import PublicKeyResponse, _validate_nacl_public_key
 from app.ws.chat import is_user_online
 
@@ -38,6 +39,16 @@ async def update_public_key(
         )
     user.public_key = body.public_key
     await db.commit()
+
+    # Any messages queued while this user was offline were encrypted for the
+    # old public key and cannot be decrypted after a key rotation. Clear the
+    # queue so stale ciphertext is not delivered on the next connection.
+    r = get_redis()
+    try:
+        await r.delete(f"offline:{current_user_id}")
+    finally:
+        await r.aclose()
+
     return {"message": "Public key updated"}
 
 
