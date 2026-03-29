@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import secrets
 import time
 import uuid
 
@@ -23,6 +24,9 @@ _connections: dict[str, WebSocket] = {}
 _online_users: dict[str, str] = {}
 
 REDIS_CHANNEL = "whisper:messages"
+
+OFFLINE_QUEUE_PREFIX = "offline:"
+OFFLINE_QUEUE_TTL = 7 * 24 * 3600  # 7 days
 
 # Strong reference to prevent garbage collection (Python asyncio only keeps weak refs)
 _subscriber_task: asyncio.Task | None = None
@@ -51,6 +55,52 @@ def is_user_online(username: str) -> bool:
     return username in _online_users
 
 
+async def _queue_offline(target_id: str, payload: dict) -> None:
+    """Store an encrypted message in a per-user Redis list for later delivery."""
+    r = get_redis()
+    try:
+        key = f"{OFFLINE_QUEUE_PREFIX}{target_id}"
+        await r.rpush(key, json.dumps(payload))
+        await r.expire(key, OFFLINE_QUEUE_TTL)
+    finally:
+        await r.aclose()
+    logger.info("Queued offline message for user %s", target_id)
+
+
+async def _flush_offline_queue(user_id: str, websocket: WebSocket) -> None:
+    """Deliver all queued offline messages to a freshly connected user.
+
+    LPOP is atomic, so concurrent flushes on two pods each claim different
+    items with no overlap. If the WebSocket send fails the raw item is
+    pushed back to the front of the list (LPUSH) so it is retried on the
+    user's next connection.
+    """
+    r = get_redis()
+    try:
+        key = f"{OFFLINE_QUEUE_PREFIX}{user_id}"
+        count = 0
+        while True:
+            item = await r.lpop(key)  # atomic claim — only one pod gets this item
+            if item is None:
+                break
+            try:
+                payload = json.loads(item)
+                await websocket.send_text(json.dumps(payload))
+                count += 1
+            except Exception:
+                # Send failed — restore item to the front for next connection
+                await r.lpush(key, item)
+                logger.exception(
+                    "Failed to deliver offline message to %s; re-queued at front",
+                    user_id,
+                )
+                break
+        if count:
+            logger.info("Flushed %d offline message(s) to %s", count, user_id)
+    finally:
+        await r.aclose()
+
+
 async def _deliver_local(target_id: str, payload: dict) -> bool:
     """Deliver to a locally connected WebSocket. Returns True if delivered."""
     ws = _connections.get(target_id)
@@ -65,7 +115,13 @@ async def _deliver_local(target_id: str, payload: dict) -> bool:
 
 
 async def _redis_subscriber():
-    """Listen on Redis pub/sub and deliver messages to local connections."""
+    """Listen on Redis pub/sub and deliver messages to local connections.
+
+    Only one instance may queue a given message offline — a short-lived
+    dedup key (SET NX EX) ensures the first subscriber wins and the rest
+    skip the enqueue, preventing duplicate offline messages in multi-pod
+    deployments.
+    """
     while True:
         r = get_redis()
         pubsub = r.pubsub()
@@ -78,7 +134,27 @@ async def _redis_subscriber():
                 try:
                     envelope = json.loads(raw["data"])
                     target_id = envelope.get("target_id")
-                    await _deliver_local(target_id, envelope["payload"])
+                    payload = envelope["payload"]
+                    delivered = await _deliver_local(target_id, payload)
+                    if not delivered:
+                        msg_id = payload.get("msg_id")
+                        should_queue = True
+                        if msg_id:
+                            # Atomic: first instance to set this key queues the
+                            # message; all others see acquired=None and skip.
+                            r_dedup = get_redis()
+                            try:
+                                acquired = await r_dedup.set(
+                                    f"offline_dedup:{msg_id}",
+                                    "1",
+                                    nx=True,
+                                    ex=60,  # TTL longer than any reasonable delivery window
+                                )
+                                should_queue = bool(acquired)
+                            finally:
+                                await r_dedup.aclose()
+                        if should_queue:
+                            await _queue_offline(target_id, payload)
                 except Exception:
                     logger.exception("Error processing pub/sub message")
         except asyncio.CancelledError:
@@ -121,6 +197,9 @@ async def ws_chat(websocket: WebSocket, ticket: str = Query(...)):
     if sender_name:
         _online_users[sender_name] = uid_str
     logger.info("WS connected: %s", sender_name)
+
+    # Deliver any messages that arrived while this user was offline
+    await _flush_offline_queue(uid_str, websocket)
 
     try:
         while True:
@@ -170,6 +249,7 @@ async def ws_chat(websocket: WebSocket, ticket: str = Query(...)):
                 continue
 
             payload = {
+                "msg_id": secrets.token_hex(16),
                 "from": sender_name,
                 "ciphertext": ciphertext,
                 "nonce": nonce,
@@ -182,22 +262,31 @@ async def ws_chat(websocket: WebSocket, ticket: str = Query(...)):
                 envelope = json.dumps({"target_id": target_id, "payload": payload})
                 r = get_redis()
                 try:
-                    await r.publish(REDIS_CHANNEL, envelope)
+                    receivers = await r.publish(REDIS_CHANNEL, envelope)
+                    if receivers == 0:
+                        # No subscribers are active right now (startup gap or the
+                        # 2-second restart window in _redis_subscriber). Queue
+                        # directly so the message is not silently dropped.
+                        await _queue_offline(target_id, payload)
                 finally:
                     await r.aclose()
+                # Either a live subscriber received it or it is safely in the
+                # offline queue — either way the relay accepted the message.
+                delivered = True
 
             # Notify sender of delivery status
             await websocket.send_text(
-                json.dumps({
-                    "type": "status",
-                    "to": recipient,
-                    "delivered": delivered,
-                    "timestamp": payload["timestamp"],
-                })
+                json.dumps(
+                    {
+                        "type": "status",
+                        "to": recipient,
+                        "delivered": delivered,
+                        "timestamp": payload["timestamp"],
+                    }
+                )
             )
 
-            if delivered:
-                logger.info("Message relayed: %s -> %s", sender_name, recipient)
+            logger.info("Message relayed: %s -> %s", sender_name, recipient)
 
     except WebSocketDisconnect:
         logger.info("WS disconnected: %s", sender_name)
