@@ -32,7 +32,8 @@ OFFLINE_QUEUE_TTL = 7 * 24 * 3600  # 7 days
 _subscriber_task: asyncio.Task | None = None
 
 # Maximum allowed length for ciphertext and nonce (base64-encoded)
-MAX_CIPHERTEXT_LEN = 65_536  # ~48 KB of raw ciphertext
+# 716 800 bytes covers a 2-minute voice message at 32 kbps (≈480 KB raw → ≈640 KB base64)
+MAX_CIPHERTEXT_LEN = 716_800
 MAX_NONCE_LEN = 64  # NaCl nonce is 24 bytes → 32 chars base64
 
 
@@ -248,13 +249,19 @@ async def ws_chat(websocket: WebSocket, ticket: str = Query(...)):
                 await websocket.send_text(json.dumps({"error": "Recipient not found"}))
                 continue
 
+            msg_type = msg.get("type", "text")
+            duration = msg.get("duration")
+
             payload = {
                 "msg_id": secrets.token_hex(16),
                 "from": sender_name,
+                "type": msg_type,
                 "ciphertext": ciphertext,
                 "nonce": nonce,
                 "timestamp": int(time.time()),
             }
+            if duration is not None:
+                payload["duration"] = duration
 
             # Try direct local delivery first
             delivered = await _deliver_local(target_id, payload)
