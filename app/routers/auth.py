@@ -1,5 +1,10 @@
+import base64
+import hashlib
+import hmac
 import ipaddress
 import logging
+import math
+import time
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -158,3 +163,39 @@ async def issue_ws_ticket(
     """Issue a short-lived, single-use ticket for WebSocket authentication."""
     ticket = await create_ws_ticket(current_user_id)
     return {"ticket": ticket}
+
+
+@router.post("/turn-credentials")
+async def get_turn_credentials(
+    current_user_id: uuid.UUID = Depends(get_current_user_id),
+):
+    """Return time-limited TURN credentials signed with the coturn static-auth-secret.
+
+    Uses the TURN REST API credential format:
+    username = "{expiry_unix}:{user_id}"
+    credential = base64(HMAC-SHA1(secret, username))
+    """
+    if not settings.COTURN_SECRET:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="TURN server not configured",
+        )
+
+    expiry = math.floor(time.time()) + 3600  # valid for 1 hour
+    username = f"{expiry}:{current_user_id}"
+    credential = base64.b64encode(
+        hmac.new(
+            settings.COTURN_SECRET.encode(),
+            username.encode(),
+            hashlib.sha1,
+        ).digest()
+    ).decode()
+
+    return {
+        "urls": [
+            f"stun:{settings.COTURN_REALM}:3478",
+            f"turn:{settings.COTURN_REALM}:3478",
+        ],
+        "username": username,
+        "credential": credential,
+    }

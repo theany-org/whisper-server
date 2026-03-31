@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     CORS_ORIGINS: str = ""  # comma-separated origins, e.g. "https://app.example.com"
 
     # Environment
-    ENVIRONMENT: str = "production"  # "development" or "production"
+    ENVIRONMENT: str = ""  # "development" or "production"
 
     # WebSocket auth ticket TTL
     WS_TICKET_TTL: int = 30  # seconds
@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     # Trusted proxy IPs that are allowed to set X-Forwarded-For
     # Comma-separated, e.g. "127.0.0.1,10.0.0.0/8"
     TRUSTED_PROXIES: str = ""
+
+    # coturn TURN server (self-hosted)
+    COTURN_SECRET: str = ""
+    COTURN_REALM: str = "turn.example.com"
 
     model_config = {"env_file": ".env", "extra": "ignore"}
 

@@ -10,7 +10,7 @@ from app.middleware.auth import get_current_user_id
 from app.models.user import User
 from app.redis import get_redis
 from app.schemas.auth import PublicKeyResponse, _validate_nacl_public_key
-from app.ws.chat import is_user_online
+from app.ws.chat import _is_online
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -77,12 +77,12 @@ async def check_user_exists(
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
-        select(User.username).where(User.username == username.lower())
+        select(User.id, User.username).where(User.username == username.lower())
     )
-    row = result.scalar_one_or_none()
+    row = result.one_or_none()
     if row is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found",
         )
-    return {"username": row, "online": is_user_online(row)}
+    return {"username": row.username, "online": await _is_online(str(row.id))}

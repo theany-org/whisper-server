@@ -46,5 +46,16 @@ services:
       retries: 5
       start_period: 15s
 
+  coturn:
+    image: coturn/coturn:4.6-alpine
+    network_mode: host
+    volumes:
+      - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+      - coturn_logs:/var/log/coturn
+    env_file: .env
+    restart: unless-stopped
+    command: -c /etc/coturn/turnserver.conf
+
 volumes:
   pgdata:
+  coturn_logs:
