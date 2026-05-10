@@ -34,6 +34,9 @@ OFFLINE_QUEUE_TTL = 7 * 24 * 3600  # 7 days
 PRESENCE_PREFIX = "ws:online:"
 PRESENCE_TTL = 24 * 3600  # 24h — deleted on clean disconnect, expires as crash fallback
 
+# Redis Set of all currently online user_id strings — O(1) add/remove, O(N) snapshot
+ONLINE_SET_KEY = "whisper:online"
+
 # Redis keys for call state
 CALL_USER_PREFIX = "call:user:"
 CALL_PARTS_PREFIX = "call:parts:"
@@ -42,8 +45,10 @@ CALL_STATE_TTL = 3600  # 1 hour safety expiry
 # Strong reference to prevent garbage collection
 _subscriber_task: asyncio.Task | None = None
 
-# Maximum allowed length for ciphertext and nonce (base64-encoded)
-MAX_CIPHERTEXT_LEN = 716_800
+# Maximum allowed lengths for ciphertext and nonce (base64-encoded)
+MAX_CIPHERTEXT_LEN = 716_800         # ~500 KB raw  — chat and voice
+MAX_MEDIA_CIPHERTEXT_LEN = 20_971_520  # ~15 MB raw  — images and files (WS relay path)
+MAX_RAW_FRAME_LEN = MAX_MEDIA_CIPHERTEXT_LEN + 4096  # pre-parse guard
 MAX_NONCE_LEN = 64
 
 
@@ -73,6 +78,7 @@ async def _set_presence(user_id: str) -> None:
     r = get_redis()
     try:
         await r.set(f"{PRESENCE_PREFIX}{user_id}", "1", ex=PRESENCE_TTL)
+        await r.sadd(ONLINE_SET_KEY, user_id)
     finally:
         await r.aclose()
 
@@ -82,6 +88,7 @@ async def _clear_presence(user_id: str) -> None:
     r = get_redis()
     try:
         await r.delete(f"{PRESENCE_PREFIX}{user_id}")
+        await r.srem(ONLINE_SET_KEY, user_id)
     finally:
         await r.aclose()
 
@@ -99,21 +106,25 @@ async def _get_online_usernames() -> list[str]:
     """Return usernames of all currently online users (cross-worker, via Redis)."""
     r = get_redis()
     try:
-        user_ids: list[uuid.UUID] = []
-        async for key in r.scan_iter(f"{PRESENCE_PREFIX}*"):
-            try:
-                user_ids.append(uuid.UUID(key[len(PRESENCE_PREFIX) :]))
-            except ValueError:
-                pass
-        if not user_ids:
-            return []
-        async with async_session() as db:
-            result = await db.execute(
-                select(User.username).where(User.id.in_(user_ids))
-            )
-            return [row[0] for row in result.fetchall()]
+        members: set[str] = await r.smembers(ONLINE_SET_KEY)
     finally:
         await r.aclose()
+
+    user_ids: list[uuid.UUID] = []
+    for uid in members:
+        try:
+            user_ids.append(uuid.UUID(uid))
+        except ValueError:
+            pass
+
+    if not user_ids:
+        return []
+
+    async with async_session() as db:
+        result = await db.execute(
+            select(User.username).where(User.id.in_(user_ids))
+        )
+        return [row[0] for row in result.fetchall()]
 
 
 async def _broadcast_presence(username: str, *, online: bool) -> None:
@@ -372,7 +383,6 @@ async def _handle_chat(
         return
 
     msg_type = msg.get("type", "chat_message")
-    duration = msg.get("duration")
 
     payload = {
         "msg_id": secrets.token_hex(16),
@@ -382,8 +392,6 @@ async def _handle_chat(
         "nonce": nonce,
         "timestamp": int(time.time()),
     }
-    if duration is not None:
-        payload["duration"] = duration
 
     await _relay(target_id, payload, queue_if_offline=True)
 
@@ -400,6 +408,127 @@ async def _handle_chat(
     )
 
     logger.info("Chat relayed: %s -> %s", sender_name, recipient)
+
+
+# ─── Image handler ────────────────────────────────────────────────────────────
+
+
+async def _handle_image(
+    websocket: WebSocket,
+    msg: dict,
+    uid_str: str,
+    sender_name: str,
+) -> None:
+    recipient = msg.get("to")
+    ciphertext = msg.get("ciphertext")
+    nonce = msg.get("nonce")
+
+    if not all([recipient, ciphertext, nonce]):
+        await _send_error(websocket, "Missing required fields: to, ciphertext, nonce")
+        return
+
+    if not isinstance(ciphertext, str) or not isinstance(nonce, str):
+        await _send_error(websocket, "ciphertext and nonce must be strings")
+        return
+
+    if len(ciphertext) > MAX_MEDIA_CIPHERTEXT_LEN:
+        await _send_error(websocket, "File exceeds maximum allowed size (15 MB)")
+        return
+
+    if len(nonce) > MAX_NONCE_LEN:
+        await _send_error(websocket, "nonce exceeds maximum allowed size")
+        return
+
+    target_id = await _resolve_username_to_id(recipient)
+    if target_id is None:
+        await _send_error(websocket, "Recipient not found")
+        return
+
+    payload: dict = {
+        "msg_id": secrets.token_hex(16),
+        "from": sender_name,
+        "type": msg.get("type", "image"),
+        "ciphertext": ciphertext,
+        "nonce": nonce,
+        "timestamp": int(time.time()),
+    }
+
+    await _relay(target_id, payload, queue_if_offline=True)
+
+    await websocket.send_text(
+        json.dumps(
+            {
+                "type": "status",
+                "to": recipient,
+                "delivered": True,
+                "timestamp": payload["timestamp"],
+                "msg_id": payload["msg_id"],
+            }
+        )
+    )
+
+    logger.info(
+        "Image relayed: %s -> %s (%s bytes ciphertext)",
+        sender_name,
+        recipient,
+        len(ciphertext),
+    )
+
+
+# ─── File transfer signal handler ─────────────────────────────────────────────
+
+FILE_SIGNAL_TYPES = frozenset(
+    {
+        "file_rtc_offer",
+        "file_rtc_answer",
+        "file_rtc_ice",
+        "file_cancel",
+    }
+)
+
+
+async def _handle_file_signal(
+    websocket: WebSocket,
+    msg: dict,
+    uid_str: str,
+    sender_name: str,
+) -> None:
+    """Relay large-file transfer handshake signals (no data, no queueing)."""
+    to = msg.get("to")
+    if not to:
+        await _send_error(websocket, "Missing required field: to")
+        return
+
+    target_id = await _resolve_username_to_id(to)
+    if target_id is None:
+        await _send_error(websocket, "Recipient not found")
+        return
+
+    msg_type = msg.get("type")
+    relay_payload: dict = {
+        "type": msg_type,
+        "from": sender_name,
+        "transfer_id": msg.get("transfer_id", ""),
+    }
+
+    if msg_type in ("file_rtc_offer", "file_rtc_answer"):
+        sdp = msg.get("sdp")
+        if sdp is not None:
+            relay_payload["sdp"] = sdp
+        # file_rtc_offer carries file metadata so the receiver knows what's arriving
+        if msg_type == "file_rtc_offer":
+            for field in ("file_name", "file_size", "mime_type"):
+                val = msg.get(field)
+                if val is not None:
+                    relay_payload[field] = val
+    elif msg_type == "file_rtc_ice":
+        candidate = msg.get("candidate")
+        if candidate is not None:
+            relay_payload["candidate"] = candidate
+
+    # File signals are not queued — both peers must be online for P2P transfer
+    await _relay(target_id, relay_payload, queue_if_offline=False)
+    logger.info("File signal relayed: %s -> %s (type=%s)", sender_name, to, msg_type)
 
 
 # ─── Call signal handlers ─────────────────────────────────────────────────────
@@ -454,8 +583,19 @@ async def _handle_call_offer(
         await _send_error(websocket, "You are already in a call")
         return
 
-    await _set_user_in_call(uid_str, call_id, uid_str, target_id)
-    await _set_user_in_call(target_id, call_id, uid_str, target_id)
+    # Only mark the callee as busy at offer time. The caller is committed once
+    # the answer arrives — this prevents locking the caller out of new calls if
+    # the callee never responds and no decline signal is sent.
+    r = get_redis()
+    try:
+        await r.set(f"{CALL_USER_PREFIX}{target_id}", call_id, ex=CALL_STATE_TTL)
+        await r.set(
+            f"{CALL_PARTS_PREFIX}{call_id}",
+            f"{uid_str}:{target_id}",
+            ex=CALL_STATE_TTL,
+        )
+    finally:
+        await r.aclose()
 
     # Relay through Redis pub/sub so other workers can deliver it
     await _relay(
@@ -491,6 +631,13 @@ async def _handle_call_answer(
         await _send_error(websocket, "Recipient not found")
         return
 
+    # Commit the caller's in-call state now that the call is accepted.
+    r = get_redis()
+    try:
+        await r.set(f"{CALL_USER_PREFIX}{target_id}", call_id, ex=CALL_STATE_TTL)
+    finally:
+        await r.aclose()
+
     await _relay(
         target_id,
         {
@@ -525,16 +672,21 @@ async def _handle_call_ice(
     if target_id is None:
         return
 
-    await _relay(
-        target_id,
-        {
-            "type": "call_ice_candidate",
-            "call_id": call_id,
-            "from": sender_name,
-            "candidate": candidate,
-        },
-        queue_if_offline=False,
-    )
+    relay_payload: dict = {
+        "type": "call_ice_candidate",
+        "call_id": call_id,
+        "from": sender_name,
+        "candidate": candidate,
+    }
+    # sdp_mid and sdp_mline_index are required by WebRTC to apply the candidate.
+    sdp_mid = msg.get("sdp_mid")
+    sdp_mline_index = msg.get("sdp_mline_index")
+    if sdp_mid is not None:
+        relay_payload["sdp_mid"] = sdp_mid
+    if sdp_mline_index is not None:
+        relay_payload["sdp_mline_index"] = sdp_mline_index
+
+    await _relay(target_id, relay_payload, queue_if_offline=False)
 
 
 async def _handle_call_decline(
@@ -667,9 +819,7 @@ async def ws_chat(websocket: WebSocket, ticket: str = Query(...)):
         while True:
             raw = await websocket.receive_text()
 
-            if (
-                len(raw) > MAX_CIPHERTEXT_LEN + 4096
-            ):  # 4 KB headroom for envelope fields
+            if len(raw) > MAX_RAW_FRAME_LEN:
                 await _send_error(websocket, "Message too large")
                 continue
 
@@ -687,6 +837,10 @@ async def ws_chat(websocket: WebSocket, ticket: str = Query(...)):
 
             if msg_type in ("chat_message", "voice"):
                 await _handle_chat(websocket, msg, uid_str, sender_name)
+            elif msg_type in ("image", "file"):
+                await _handle_image(websocket, msg, uid_str, sender_name)
+            elif msg_type in FILE_SIGNAL_TYPES:
+                await _handle_file_signal(websocket, msg, uid_str, sender_name)
             elif msg_type in CALL_SIGNAL_TYPES:
                 handler = _CALL_HANDLERS[msg_type]
                 await handler(websocket, msg, uid_str, sender_name)

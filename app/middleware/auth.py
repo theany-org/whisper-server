@@ -1,4 +1,5 @@
 import secrets
+import time
 import uuid
 
 from fastapi import Depends, HTTPException, status
@@ -22,6 +23,11 @@ def _session_key(user_id: str) -> str:
 
 
 async def store_session(user_id: uuid.UUID, token: str) -> None:
+    # Single-session by design: each new login overwrites the previous token,
+    # immediately invalidating any existing session on another device.
+    # This mirrors Signal's desktop model — one active session per user.
+    # To support multi-device, replace SET with SADD into a per-user token set
+    # and update session_exists / delete_session accordingly.
     r = get_redis()
     try:
         await r.set(_session_key(str(user_id)), token, ex=SESSION_TTL)
@@ -82,22 +88,40 @@ async def redeem_ws_ticket(ticket: str) -> uuid.UUID | None:
 
 # ── Rate limiter helpers ───────────────────────────────────────────────
 
-# Lua script for atomic rate limiting: INCR + conditional EXPIRE in one round-trip
+# True sliding-window rate limiter using a Redis sorted set.
+# Each request is stored as a member scored by its millisecond timestamp.
+# On every call: expired members (older than the window) are pruned first,
+# then the remaining count is checked against the limit.
+# This prevents the fixed-window boundary burst (2× limit in 2 requests) that
+# the previous INCR+EXPIRE approach allowed.
+#
+# ARGV[1] = now_ms   — current time in milliseconds
+# ARGV[2] = win_ms   — window size in milliseconds
+# ARGV[3] = limit    — max requests allowed in the window
+# Returns 1 if the request is allowed, 0 if rate-limited.
 _RATE_LIMIT_SCRIPT = """
-local current = redis.call('INCR', KEYS[1])
-if current == 1 then
-    redis.call('EXPIRE', KEYS[1], ARGV[1])
+local now_ms = tonumber(ARGV[1])
+local win_ms = tonumber(ARGV[2])
+local limit  = tonumber(ARGV[3])
+
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now_ms - win_ms)
+local count = redis.call('ZCARD', KEYS[1])
+if count >= limit then
+    return 0
 end
-return current
+redis.call('ZADD', KEYS[1], now_ms, now_ms .. math.random(1000000000))
+redis.call('PEXPIRE', KEYS[1], win_ms)
+return 1
 """
 
 
 async def check_rate_limit(key: str, limit: int, window: int) -> None:
-    """Atomic sliding-window counter rate limiter."""
+    """Sliding-window rate limiter. Raises 429 if the limit is exceeded."""
+    now_ms = int(time.time() * 1000)
     r = get_redis()
     try:
-        current = await r.eval(_RATE_LIMIT_SCRIPT, 1, key, window)
-        if int(current) > limit:
+        allowed = await r.eval(_RATE_LIMIT_SCRIPT, 1, key, now_ms, window * 1000, limit)
+        if not allowed:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="Too many requests. Try again later.",
